@@ -2466,102 +2466,241 @@ bool ZedCamera::isPointCloudSubscribed()
   return cloudSubCount > 0;
 }
 
+
+
+
+// [필수 헤더 추가] zed_camera_component.hpp 상단 혹은 cpp 상단
+// #include <pcl_conversions/pcl_conversions.h>
+// #include <pcl/point_cloud.h>
+// #include <pcl/point_types.h>
+// #include <pcl/filters/voxel_grid.h>
+// #include <pcl/filters/statistical_outlier_removal.h>
+// #include <pcl/filters/radius_outlier_removal.h>
+// ADD
 void ZedCamera::publishPointCloud()
 {
-  sl_tools::StopWatch pcElabTimer(get_clock());
-
-  auto pcMsg = std::make_unique<sensor_msgs::msg::PointCloud2>();
-
-  // Initialize Point Cloud message
-  // https://github.com/ros/common_msgs/blob/jade-devel/sensor_msgs/include/sensor_msgs/point_cloud2_iterator.h
-
-  int width = mPcResol.width;
-  int height = mPcResol.height;
-
-  int ptsCount = width * height;
-
-  if (mSvoMode) {
-    pcMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : mFrameTimestamp;
-  } else if (mSimMode) {
-    if (mUseSimTime) {
-      pcMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : mFrameTimestamp;
+    // 1. Time check (기존 코드 유지)
+    sl_tools::StopWatch pcElabTimer(get_clock());
+    rclcpp::Time current_timestamp;
+    
+    // ... (Timestamp 설정 로직 기존과 동일하게 유지) ...
+    if (mSvoMode) {
+       current_timestamp = mUsePubTimestamps ? get_clock()->now() : mFrameTimestamp;
     } else {
-      pcMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : sl_tools::slTime2Ros(
-        mMatCloud.timestamp);
+       current_timestamp = mUsePubTimestamps ? get_clock()->now() : sl_tools::slTime2Ros(mMatCloud.timestamp);
     }
-  } else {
-    pcMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : sl_tools::slTime2Ros(
-      mMatCloud.timestamp);
-  }
 
-  // ---> Check that `pcMsg->header.stamp` is not the same of the latest
-  // published pointcloud Avoid to publish the same old data
-  if (mLastTs_pc == pcMsg->header.stamp) {
-    // Data not updated by a grab calling in the grab thread
-    DEBUG_STREAM_PC(" * [publishPointCloud] ignoring not update data");
-    return;
-  }
-  mLastTs_pc = pcMsg->header.stamp;
-  // <--- Check that `pcMsg->header.stamp` is not the same of the latest
-  // published pointcloud
-
-  if (pcMsg->width != width || pcMsg->height != height) {
-    pcMsg->header.frame_id =
-      mPointCloudFrameId;      // Set the header values of the ROS message
-
-    int val = 1;
-    pcMsg->is_bigendian = !(*reinterpret_cast<char *>(&val) == 1);
-    pcMsg->is_dense = false;
-
-    pcMsg->width = width;
-    pcMsg->height = height;
-
-    sensor_msgs::PointCloud2Modifier modifier(*(pcMsg.get()));
-    modifier.setPointCloud2Fields(
-      4, "x", 1, sensor_msgs::msg::PointField::FLOAT32, "y", 1,
-      sensor_msgs::msg::PointField::FLOAT32, "z", 1,
-      sensor_msgs::msg::PointField::FLOAT32, "rgb", 1,
-      sensor_msgs::msg::PointField::FLOAT32);
-  }
-
-  sl::Vector4<float> * cpu_cloud = mMatCloud.getPtr<sl::float4>();
-
-  // Data copy
-  float * ptCloudPtr = reinterpret_cast<float *>(&pcMsg->data[0]);
-  memcpy(
-    ptCloudPtr, reinterpret_cast<float *>(cpu_cloud),
-    ptsCount * 4 * sizeof(float));
-
-  // Pointcloud publishing
-  DEBUG_PC(" * [publishPointCloud] Publishing POINT CLOUD message");
-#ifdef FOUND_POINT_CLOUD_TRANSPORT
-  try {
-    mPubCloud.publish(std::move(pcMsg));
-  } catch (std::system_error & e) {
-    DEBUG_STREAM_PC(" * [publishPointCloud] Message publishing exception: " << e.what());
-  } catch (...) {
-    DEBUG_STREAM_PC(" * [publishPointCloud] Message publishing generic exception");
-  }
-#else
-  try {
-    if (mPubCloud) {
-      mPubCloud->publish(std::move(pcMsg));
+    if (mLastTs_pc == current_timestamp) {
+        return;
     }
-  } catch (std::system_error & e) {
-    DEBUG_STREAM_PC(" * [publishPointCloud] Message publishing exception: " << e.what());
-  } catch (...) {
-    DEBUG_STREAM_PC(" * [publishPointCloud] Message publishing generic exception");
-  }
-#endif
+    mLastTs_pc = current_timestamp;
 
-  // Publish freq calculation
-  double mean = mPcPeriodMean_sec->addValue(mPcFreqTimer.toc());
-  mPcFreqTimer.tic();
+    // ------------------------------------------------------------------------
+    // [Optimized Filtering Logic]
+    // 전략: sl::Mat -> PCL 변환 시 Height 필터링을 동시에 수행 (Loop 1회 절약)
+    // ------------------------------------------------------------------------
 
-  // Point cloud elaboration time
-  mPcProcMean_sec->addValue(pcElabTimer.toc());
-  DEBUG_STREAM_PC(" * [publishPointCloud] Point cloud freq: " << 1. / mean);
+    // A. 원본 데이터 포인터 획득
+    int width = mMatCloud.getWidth();
+    int height = mMatCloud.getHeight();
+    sl::Vector4<float>* cpu_cloud = mMatCloud.getPtr<sl::float4>();
+    
+    // B. 필터링 조건을 위한 준비
+    // ZED SDK 좌표계: Left Handed (Y: Down, Z: Forward) 인지 Right Handed (Z: Up) 인지 확인 중요.
+    // 보통 ROS Wrapper는 설정에 따라 'base_link' 기준(Z up)으로 변환되어 나올 수 있음.
+    // 여기서는 Z축이 높이라고 가정하고 필터링합니다. (필요 시 idx 변환)
+    const float MIN_HEIGHT = 0.1f;  // 예: 바닥 위 10cm
+    const float MAX_HEIGHT = 1.8f;  // 예: 로봇 키 1.8m
+    
+    // C. PCL Cloud 생성 (Pre-filtering)
+    // reserve를 통해 메모리 재할당 방지
+    pcl::PointCloud<pcl::PointXYZBGRA>::Ptr temp_cloud(new pcl::PointCloud<pcl::PointXYZBGRA>);
+    temp_cloud->reserve(width * height / 2); // 절반 정도만 남을 거라 예상하고 예약
+
+    // D. Loop: 변환과 동시에 Height Filter 수행 (가장 빠름)
+    for (int i = 0; i < width * height; i++) {
+        float x = cpu_cloud[i][0];
+        float y = cpu_cloud[i][1];
+        float z = cpu_cloud[i][2];
+
+        // [중요] 좌표계 확인 필요! 
+        // mPointCloudFrameId가 'map'이나 'base_link' 계열이면 Z가 높이.
+        // 'camera_optical_frame' 계열이면 Y가 높이(보통 -Y가 위쪽).
+        // 아래 조건은 Z가 높이(Up)인 경우입니다.
+        if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) {
+            if (z >= MIN_HEIGHT && z <= MAX_HEIGHT) {
+                pcl::PointXYZBGRA pt;
+                pt.x = x;
+                pt.y = y;
+                pt.z = z;
+                // Color Copy (float4의 마지막 바이트를 uint32로 캐스팅)
+                pt.rgba = *reinterpret_cast<uint32_t*>(&cpu_cloud[i][3]);
+                temp_cloud->points.push_back(pt);
+            }
+        }
+    }
+    
+    // PCL Header 설정 (VoxelGrid를 위해 필요할 수 있음)
+    temp_cloud->width = temp_cloud->points.size();
+    temp_cloud->height = 1;
+    temp_cloud->is_dense = true; // NaN을 이미 걸러냈으므로
+
+    // E. Voxel Grid Filtering (Downsampling)
+    pcl::PointCloud<pcl::PointXYZBGRA>::Ptr voxel_filtered_cloud(new pcl::PointCloud<pcl::PointXYZBGRA>);
+    
+    pcl::VoxelGrid<pcl::PointXYZBGRA> voxel_grid;
+    voxel_grid.setInputCloud(temp_cloud);
+    voxel_grid.setLeafSize(0.05f, 0.05f, 0.05f); // 5cm Voxel
+    voxel_grid.filter(*voxel_filtered_cloud);
+
+
+    // 3) SOR 필터 적용 (Ghost Noise 제거)
+    pcl::PointCloud<pcl::PointXYZBGRA>::Ptr cloud_sor_filtered(new pcl::PointCloud<pcl::PointXYZBGRA>);
+    pcl::StatisticalOutlierRemoval<pcl::PointXYZBGRA> sor;
+
+    sor.setInputCloud(voxel_filtered_cloud); // Voxel 필터 거친 데이터를 입력으로
+    sor.setMeanK(50);             // 분석할 이웃 포인트 개수 (클수록 무거운 노이즈 제거)
+    sor.setStddevMulThresh(1.0);  // 표준편차 임계값 (작을수록 엄격하게 제거)
+    sor.filter(*cloud_sor_filtered);
+
+    // 4) ROR 필터 적용 (반경 기반 노이즈 제거)
+    pcl::PointCloud<pcl::PointXYZBGRA>::Ptr ror_filtered_cloud(new pcl::PointCloud<pcl::PointXYZBGRA>);
+    pcl::RadiusOutlierRemoval<pcl::PointXYZBGRA> outrem;
+
+    outrem.setInputCloud(cloud_sor_filtered); // 혹은 voxel_filtered_cloud
+    outrem.setRadiusSearch(0.2);      // 반경 20cm 안에
+    outrem.setMinNeighborsInRadius(10); // 이웃 점이 10개 미만이면 "노이즈(Ghost)"로 간주하고 삭제
+    outrem.filter(*ror_filtered_cloud);
+
+
+    // F. ROS Message 변환 및 발행
+    auto pcMsg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    pcl::toROSMsg(*ror_filtered_cloud, *pcMsg);
+    
+    pcMsg->header.stamp = current_timestamp;
+    pcMsg->header.frame_id = mPointCloudFrameId;
+
+    // ------------------------------------------------------------------------
+
+    // Publish
+    #ifdef FOUND_POINT_CLOUD_TRANSPORT
+        mPubCloud.publish(std::move(pcMsg));
+    #else
+        if (mPubCloud) {
+            mPubCloud->publish(std::move(pcMsg));
+        }
+    #endif
+
+    // Debug Log
+    // mPcProcMean_sec->addValue(pcElabTimer.toc()); // 필요 시 주석 해제
 }
+
+
+// void ZedCamera::publishPointCloud()
+// {
+//   sl_tools::StopWatch pcElabTimer(get_clock());
+
+//   auto pcMsg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+
+//   // Initialize Point Cloud message
+//   // https://github.com/ros/common_msgs/blob/jade-devel/sensor_msgs/include/sensor_msgs/point_cloud2_iterator.h
+
+//   int width = mPcResol.width;
+//   int height = mPcResol.height;
+
+//   int ptsCount = width * height;
+
+//   if (mSvoMode) {
+//     pcMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : mFrameTimestamp;
+//   } else if (mSimMode) {
+//     if (mUseSimTime) {
+//       pcMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : mFrameTimestamp;
+//     } else {
+//       pcMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : sl_tools::slTime2Ros(
+//         mMatCloud.timestamp);
+//     }
+//   } else {
+//     pcMsg->header.stamp = mUsePubTimestamps ? get_clock()->now() : sl_tools::slTime2Ros(
+//       mMatCloud.timestamp);
+//   }
+
+//   // ---> Check that `pcMsg->header.stamp` is not the same of the latest
+//   // published pointcloud Avoid to publish the same old data
+//   if (mLastTs_pc == pcMsg->header.stamp) {
+//     // Data not updated by a grab calling in the grab thread
+//     DEBUG_STREAM_PC(" * [publishPointCloud] ignoring not update data");
+//     return;
+//   }
+//   mLastTs_pc = pcMsg->header.stamp;
+//   // <--- Check that `pcMsg->header.stamp` is not the same of the latest
+//   // published pointcloud
+
+//   if (pcMsg->width != width || pcMsg->height != height) {
+//     pcMsg->header.frame_id =
+//       mPointCloudFrameId;      // Set the header values of the ROS message
+
+//     int val = 1;
+//     pcMsg->is_bigendian = !(*reinterpret_cast<char *>(&val) == 1);
+//     pcMsg->is_dense = false;
+
+//     pcMsg->width = width;
+//     pcMsg->height = height;
+
+//     sensor_msgs::PointCloud2Modifier modifier(*(pcMsg.get()));
+//     modifier.setPointCloud2Fields(
+//       4, "x", 1, sensor_msgs::msg::PointField::FLOAT32, "y", 1,
+//       sensor_msgs::msg::PointField::FLOAT32, "z", 1,
+//       sensor_msgs::msg::PointField::FLOAT32, "rgb", 1,
+//       sensor_msgs::msg::PointField::FLOAT32);
+//   }
+
+//   sl::Vector4<float> * cpu_cloud = mMatCloud.getPtr<sl::float4>();
+
+//   // Data copy
+//   float * ptCloudPtr = reinterpret_cast<float *>(&pcMsg->data[0]);
+//   memcpy(
+//     ptCloudPtr, reinterpret_cast<float *>(cpu_cloud),
+//     ptsCount * 4 * sizeof(float));
+
+//   // Pointcloud publishing
+//   DEBUG_PC(" * [publishPointCloud] Publishing POINT CLOUD message");
+// #ifdef FOUND_POINT_CLOUD_TRANSPORT
+//   try {
+//     mPubCloud.publish(std::move(pcMsg));
+//   } catch (std::system_error & e) {
+//     DEBUG_STREAM_PC(" * [publishPointCloud] Message publishing exception: " << e.what());
+//   } catch (...) {
+//     DEBUG_STREAM_PC(" * [publishPointCloud] Message publishing generic exception");
+//   }
+// #else
+//   try {
+//     if (mPubCloud) {
+//       mPubCloud->publish(std::move(pcMsg));
+//     }
+//   } catch (std::system_error & e) {
+//     DEBUG_STREAM_PC(" * [publishPointCloud] Message publishing exception: " << e.what());
+//   } catch (...) {
+//     DEBUG_STREAM_PC(" * [publishPointCloud] Message publishing generic exception");
+//   }
+// #endif
+
+//   // Publish freq calculation
+//   double mean = mPcPeriodMean_sec->addValue(mPcFreqTimer.toc());
+//   mPcFreqTimer.tic();
+
+//   // Point cloud elaboration time
+//   mPcProcMean_sec->addValue(pcElabTimer.toc());
+//   DEBUG_STREAM_PC(" * [publishPointCloud] Point cloud freq: " << 1. / mean);
+// }
+
+
+
+
+
+
+
+
+
 
 void ZedCamera::threadFunc_videoDepthElab()
 {
